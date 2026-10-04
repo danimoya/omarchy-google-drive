@@ -50,7 +50,8 @@ Added a native bar-widget manifest and QML entry point. Click actions use argume
 
 ## Publishing and attribution
 
+See [publisher account setup and directory workflow](PUBLISHING.md) and the [validation record](VALIDATION.md).
+
 One root manifest identifies this plugin as `danimoya.gdrive`. [Marketplace submission draft](MARKETPLACE-SUBMISSION.md) is intentionally incomplete until release checks pass. Submit the same public repository to [Omarchy Plugins](https://plugins.omarchy.org/publish.html) and [Omahub](https://omahub.dev/submit).
 
 Source provenance and upstream credits are recorded in [NOTICE.md](NOTICE.md). MIT license; see [LICENSE](LICENSE). Report reproducible issues through this repository, including Omarchy and Hyprland versions and logs with personal information removed.
-
