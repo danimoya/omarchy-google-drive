@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  open) exec xdg-open "$HOME/Drive" ;;
+  toggle)
+    if systemctl --user is-active --quiet rclone-gdrive.service; then
+      exec systemctl --user stop rclone-gdrive.service
+    else
+      exec systemctl --user start rclone-gdrive.service
+    fi
+    ;;
+  refresh) exec rclone rc --url 127.0.0.1:5572 --no-auth vfs/refresh recursive=true ;;
+  *) printf 'Usage: %s open|toggle|refresh\n' "$0" >&2; exit 2 ;;
+esac

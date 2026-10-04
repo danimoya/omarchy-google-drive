@@ -1,0 +1,239 @@
+#!/usr/bin/env bash
+# Bar status for the rclone Google Drive mount (~/Drive).
+#
+# Prints ONE line of Waybar-style JSON for the omarchy.bar custom "command"
+# module: {"text":"<icon>","tooltip":"<plain text>","class":"<active|>"}.
+#
+# Two rules keep the bar readable:
+#   1. "text" must never be empty. Bar.qml does `data.text || raw.trim()`, so an
+#      empty text makes the bar fall back to printing this whole JSON blob.
+#   2. Every rclone rc payload is parsed with jq here; only rendered plain-text
+#      lines ever reach "tooltip".
+
+set -uo pipefail
+
+MOUNT="$HOME/Drive"
+UNIT="rclone-gdrive.service"
+RC="http://127.0.0.1:5572"
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy"
+RECENT_CACHE="$CACHE_DIR/gdrive-recent.tsv"
+RECENT_TTL=60        # seconds between mount walks (the bar polls every 5s)
+RECENT_MAX=5         # files listed in the tooltip
+WALK_DEPTH=2         # how deep into ~/Drive to look for recent files
+WALK_TIMEOUT=2       # hard cap so a cold dir cache never stalls the bar
+NAME_MAX=36
+
+# Nerd Font glyphs, written as escapes so they survive copy/paste and editors
+# that strip private-use characters (an empty icon is what produced the raw
+# JSON blob in the bar).
+ICON_OK=$'\U000F0160'     # md-cloud-check      - mounted, nothing pending
+ICON_UP=$'\U000F0167'     # md-cloud-upload     - uploads in flight/queued
+ICON_DOWN=$'\U000F0162'   # md-cloud-download   - downloading into the cache
+ICON_OFF=$'\U000F0164'    # md-cloud-off        - no connectivity
+ICON_WARN=$'\U000F0026'   # md-alert            - mounted but erroring
+ICON_STOP=$'\U000F015A'   # md-cloud-off-solid  - service not running
+ICON_FALLBACK="GD"
+
+emit() { # text tooltip class
+  local text="${1:-}"
+  [[ -z "$text" ]] && text="$ICON_FALLBACK"
+  jq -cn --arg t "$text" --arg tip "$2" --arg c "${3:-}" \
+    '{text:$t, tooltip:$tip, class:$c}'
+  exit 0
+}
+
+online() {
+  local state
+  state=$(nmcli -t -f CONNECTIVITY general 2>/dev/null | head -1)
+  case "$state" in
+    full|portal) return 0 ;;
+    none|limited) return 1 ;;
+    *) ip -4 route show default 2>/dev/null | grep -q . ;;
+  esac
+}
+
+rc() { curl -s --max-time 1 -X POST "$RC/$1" 2>/dev/null; }
+
+human() { numfmt --to=iec --suffix=B --format='%.1f' "${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
+
+oneline() { tr '\n\r\t' '   ' <<<"${1:-}" | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//'; }
+
+# Middle-elides a long file name so the extension stays visible.
+shorten() {
+  local s=${1:-} head_len tail_len=10
+  if (( ${#s} > NAME_MAX )); then
+    head_len=$(( NAME_MAX - tail_len - 1 ))
+    s="${s:0:head_len}…${s: -tail_len}"
+  fi
+  printf '%s' "$s"
+}
+
+# epoch -> "just now" / "7m ago" / "3h ago" / "2d ago" / "Sep 18 15:22"
+when() {
+  local ts=${1:-0} now diff
+  now=$(date +%s)
+  diff=$(( now - ts ))
+  (( diff < 0 )) && diff=0
+  if   (( diff < 60 ));     then echo "just now"
+  elif (( diff < 3600 ));   then echo "$(( diff / 60 ))m ago"
+  elif (( diff < 86400 ));  then echo "$(( diff / 3600 ))h ago"
+  elif (( diff < 604800 )); then echo "$(( diff / 86400 ))d ago"
+  else date -d "@$ts" '+%b %-d %H:%M' 2>/dev/null || echo "earlier"
+  fi
+}
+
+# Completed transfers of the running rclone session: "<epoch>\t<name>".
+transferred_lines() {
+  local payload stamp name epoch
+  payload=${core_transferred:-}
+  [[ -z "$payload" ]] && return 0
+  while IFS=$'\t' read -r stamp name; do
+    [[ -z "$name" || -z "$stamp" ]] && continue
+    epoch=$(date -d "$stamp" +%s 2>/dev/null) || continue
+    [[ -z "$epoch" ]] && continue
+    printf '%s\t%s\n' "$epoch" "$name"
+  done < <(jq -r '(.transferred // [])
+                  | map(select(((.error // "") == "") and ((.name // "") != "")))
+                  | .[]
+                  | [(.completed_at // .started_at // ""), .name]
+                  | @tsv' <<<"$payload" 2>/dev/null)
+}
+
+# Newest files visible in the mount: "<epoch>\t<relative path>".
+# Cached for RECENT_TTL so the FUSE mount is walked at most once a minute.
+walk_mount() {
+  local now stamp raw tmp
+  mkdir -p "$CACHE_DIR" 2>/dev/null
+  now=$(date +%s)
+  stamp=0
+  [[ -f "$RECENT_CACHE" ]] && stamp=$(stat -c %Y "$RECENT_CACHE" 2>/dev/null || echo 0)
+
+  if [[ ! -s "$RECENT_CACHE" ]] || (( now - stamp >= RECENT_TTL )); then
+    raw="$RECENT_CACHE.raw.$$"
+    tmp="$RECENT_CACHE.tmp.$$"
+    if timeout "$WALK_TIMEOUT" find "$MOUNT" -maxdepth "$WALK_DEPTH" -type f \
+         -printf '%T@\t%P\n' >"$raw" 2>/dev/null; then
+      { sort -rn "$raw" | head -n 20 | awk -F'\t' 'NF==2 {printf "%d\t%s\n", $1, $2}' >"$tmp"; } 2>/dev/null
+      mv -f "$tmp" "$RECENT_CACHE" 2>/dev/null || rm -f "$tmp"
+    fi
+    rm -f "$raw" "$tmp" 2>/dev/null
+  fi
+
+  [[ -s "$RECENT_CACHE" ]] && cat "$RECENT_CACHE"
+  return 0
+}
+
+# Merged, de-duplicated, newest first.
+recent_list() {
+  { transferred_lines; walk_mount; } 2>/dev/null |
+    awk -F'\t' 'NF == 2 && $1 + 0 > 1000000000 {
+                  if (!($2 in seen) || seen[$2] < $1 + 0) seen[$2] = $1 + 0
+                }
+                END { for (n in seen) printf "%d\t%s\n", seen[n], n }' |
+    sort -rn
+}
+
+# File modification times are activity evidence, not confirmed sync times.
+append_recent() {
+  local list count=0 epoch name base
+  list=$(recent_list)
+
+  if [[ -z "$list" ]]; then
+    tip+=$'\nRecent activity: no file activity yet'
+    return 0
+  fi
+
+  tip+=$'\nRecent activity: '"$(when "$(head -1 <<<"$list" | cut -f1)")"
+  tip+=$'\nRecent files:'
+  while IFS=$'\t' read -r epoch name; do
+    (( count >= RECENT_MAX )) && break
+    [[ -z "$name" ]] && continue
+    base=$(shorten "${name##*/}")
+    tip+=$'\n• '"$base  ·  $(when "$epoch")"
+    count=$(( count + 1 ))
+  done <<<"$list"
+  return 0
+}
+
+active=$(systemctl --user is-active "$UNIT" 2>/dev/null)
+if [[ "$active" != "active" ]]; then
+  if [[ "$active" == "activating" ]]; then
+    emit "$ICON_UP" $'Google Drive — ~/Drive\nStatus: mounting…' ""
+  fi
+  emit "$ICON_STOP" $'Google Drive — ~/Drive\nStatus: not mounted ('"${active:-unknown}"$')\nRight-click to start the mount' ""
+fi
+
+if ! mountpoint -q "$MOUNT"; then
+  emit "$ICON_WARN" $'Google Drive\nStatus: service running, but '"$MOUNT"$' is not mounted\nRight-click to stop, then right-click again to start' "active"
+fi
+
+vfs=$(rc vfs/stats)
+core=$(rc core/stats)
+core_transferred=$(rc core/transferred)
+
+tip=$'Google Drive — ~/Drive'
+
+if [[ -z "$vfs" ]]; then
+  tip+=$'\nStatus: mounted, status API not answering on 127.0.0.1:5572'
+  append_recent
+  emit "$ICON_WARN" "$tip" "active"
+fi
+
+read -r up_prog up_queue errored cache_bytes cache_files < <(
+  jq -r '[.diskCache.uploadsInProgress // 0,
+          .diskCache.uploadsQueued    // 0,
+          .diskCache.erroredFiles     // 0,
+          .diskCache.bytesUsed        // 0,
+          .diskCache.files            // 0] | @tsv' <<<"$vfs" 2>/dev/null
+)
+read -r transferring speed errors last_error < <(
+  jq -r '[(.transferring // [] | length),
+          (.speed // 0 | floor),
+          (.errors // 0),
+          ((.lastError // "") | gsub("[\n\r\t]"; " "))] | @tsv' <<<"$core" 2>/dev/null
+)
+
+pending=$(( ${up_prog:-0} + ${up_queue:-0} ))
+cache_h=$(human "${cache_bytes:-0}")
+
+if ! online; then
+  tip+=$'\nStatus: offline — cached files still readable'
+  [[ $pending -gt 0 ]] && tip+=$'\nWaiting to upload: '"$pending change(s)"
+  tip+=$'\nCache: '"${cache_files:-0} file(s), $cache_h"
+  append_recent
+  emit "$ICON_OFF" "$tip" ""
+fi
+
+if [[ ${errored:-0} -gt 0 || ${errors:-0} -gt 0 ]]; then
+  tip+=$'\nStatus: error — '"${errored:-0} file(s) failed to upload, ${errors:-0} transfer error(s)"
+  if [[ -n "${last_error:-}" ]]; then
+    err=$(oneline "$last_error")
+    (( ${#err} > 110 )) && err="${err:0:109}…"
+    [[ -n "$err" ]] && tip+=$'\nLast error: '"$err"
+  fi
+  tip+=$'\nCache: '"${cache_files:-0} file(s), $cache_h"
+  append_recent
+  emit "$ICON_WARN" "$tip" "active"
+fi
+
+if [[ $pending -gt 0 ]]; then
+  tip+=$'\nStatus: syncing — '"${up_prog:-0} uploading, ${up_queue:-0} queued"
+  [[ ${speed:-0} -gt 0 ]] && tip+=$'\nSpeed: '"$(human "$speed")/s"
+  tip+=$'\nCache: '"${cache_files:-0} file(s), $cache_h"
+  append_recent
+  emit "$ICON_UP $pending" "$tip" "active"
+fi
+
+if [[ ${transferring:-0} -gt 0 ]]; then
+  tip+=$'\nStatus: syncing — '"${transferring} file(s) transferring"
+  [[ ${speed:-0} -gt 0 ]] && tip+=$'\nSpeed: '"$(human "$speed")/s"
+  tip+=$'\nCache: '"${cache_files:-0} file(s), $cache_h"
+  append_recent
+  emit "$ICON_DOWN" "$tip" "active"
+fi
+
+tip+=$'\nStatus: synced — no pending changes'
+tip+=$'\nCache: '"${cache_files:-0} file(s), $cache_h"
+append_recent
+emit "$ICON_OK" "$tip" ""

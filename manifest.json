@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "danimoya.gdrive",
+  "name": "Google Drive for Omarchy",
+  "version": "0.1.0-dev",
+  "author": "Daniel Moya",
+  "license": "MIT",
+  "description": "Google Drive mount status, transfer activity, and file access from the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Google Drive for Omarchy",
+    "description": "Google Drive mount status, transfer activity, and file access from the Omarchy bar.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
